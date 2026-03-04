@@ -490,26 +490,111 @@ def calc_beta_alpha(returns: pd.DataFrame, benchmark_col: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=3600)
-def fetch_benchmark_yahoo(symbol: str, start_date: str) -> pd.Series | None:
-    """Yahoo Finance から日次リターンを取得（キャッシュ1時間）"""
+# 外部ベンチマーク: eMAXIS Slim 全世界株式（オール・カントリー）
+# 投資信託側と日付が一致するよう toushin-lib から取得する
+ACWI_ISIN  = "JP90C000H1T1"
+ACWI_SHORT = "全世界株(AC)"
+
+
+@st.cache_data(ttl=86400)
+def fetch_acwi_nav() -> pd.Series | None:
+    """eMAXIS Slim 全世界株式（AC）の NAV レベルを toushin-lib から取得（24h キャッシュ）"""
     try:
-        url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {
-            "interval": "1d",
-            "period1":  int(pd.Timestamp(start_date).timestamp()),
-            "period2":  int(pd.Timestamp.now().timestamp()),
-        }
-        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        sess.get(NISA_INIT, timeout=15)
+        r        = sess.get(f"{DETAIL}?isinCd={ACWI_ISIN}", timeout=15)
+        r.encoding = "utf-8"
+        soup     = BeautifulSoup(r.text, "html.parser")
+        inp      = soup.find("input", id="associFundCd")
+        assoc_cd = inp.get("value", "").strip() if inp else ""
+        if not assoc_cd:
             return None
-        result = r.json()["chart"]["result"][0]
-        dates  = pd.to_datetime(result["timestamp"], unit="s").normalize()
-        closes = result["indicators"]["quote"][0]["close"]
-        s      = pd.Series(closes, index=dates, name=symbol, dtype=float).dropna()
-        return s.pct_change().dropna()
+        r_csv = sess.get(
+            CSV_DL,
+            params={"isinCd": ACWI_ISIN, "associFundCd": assoc_cd},
+            timeout=30,
+        )
+        if r_csv.status_code != 200 or len(r_csv.content) < 500:
+            return None
+        df_b = pd.read_csv(BytesIO(r_csv.content), encoding="shift-jis")
+        df_b["日付"]    = pd.to_datetime(df_b["年月日"], format="%Y年%m月%d日")
+        df_b["基準価額"] = pd.to_numeric(df_b["基準価額(円)"], errors="coerce")
+        s = df_b.set_index("日付")["基準価額"].dropna().sort_index()
+        s.name = ACWI_SHORT
+        return s                        # NAV レベル（円）を返す
     except Exception:
         return None
+
+
+def calc_portfolio_weighted_return(df_pnl: pd.DataFrame,
+                                   fund_returns: pd.DataFrame) -> pd.Series:
+    """
+    評価額ウェイト加重平均によるポートフォリオ日次リターン（TWR 近似）。
+    fund_returns の列名は short() 適用済みを前提。
+    """
+    df_eval = (
+        df_pnl.groupby(["日付", "ファンド名"])["評価額"]
+        .sum().reset_index()
+    )
+    df_eval["日付"]    = pd.to_datetime(df_eval["日付"])
+    df_eval["ファンド"] = df_eval["ファンド名"].map(short)
+    df_w = df_eval.pivot(index="日付", columns="ファンド", values="評価額")
+    df_w = df_w.div(df_w.sum(axis=1), axis=0)   # 行合計=1 に正規化（ウェイト）
+
+    common_cols = df_w.columns.intersection(fund_returns.columns)
+    common_idx  = fund_returns.index.intersection(df_w.index)
+    if len(common_idx) < 2 or len(common_cols) == 0:
+        return pd.Series(dtype=float, name="ポートフォリオ")
+
+    r        = fund_returns.loc[common_idx, common_cols]
+    w        = df_w.loc[common_idx, common_cols].shift(1)   # 前日末ウェイト
+    port_ret = (r * w).sum(axis=1, min_count=1)
+    port_ret.name = "ポートフォリオ"
+    return port_ret.dropna()
+
+
+def calc_benchmark_scenario(df_pnl: pd.DataFrame,
+                             bench_nav: pd.Series) -> pd.Series:
+    """
+    実際と同じキャッシュフローでベンチマークに投資した場合の評価額推移。
+
+    Parameters
+    ----------
+    df_pnl    : 全期間の損益 DataFrame（日付・累積元本 列を持つ）
+    bench_nav : DatetimeIndex → NAV レベル（円）
+
+    Returns
+    -------
+    pd.Series (DatetimeIndex → 評価額（円）)
+    """
+    principal = (
+        df_pnl.groupby("日付")["累積元本"].sum()
+        .rename_axis("日付")
+    )
+    principal.index = pd.to_datetime(principal.index)
+    principal       = principal.sort_index()
+
+    delta      = principal.diff().fillna(principal.iloc[0])
+    new_invest = delta[delta > 0]
+
+    # 投資信託NAVは平日のみ → 全日付に forward fill
+    all_dates    = principal.index.union(bench_nav.index)
+    bench_filled = bench_nav.reindex(all_dates).ffill().dropna()
+
+    bench_units = 0.0
+    values: dict = {}
+    for date in principal.index:
+        # 新規投資があれば口数を加算
+        if date in new_invest.index and date in bench_filled.index:
+            nav = bench_filled[date]
+            if nav > 0:
+                bench_units += float(new_invest[date]) / nav
+        # 当日の評価額
+        if date in bench_filled.index:
+            values[date] = bench_units * bench_filled[date]
+
+    return pd.Series(values, name=f"ベンチマーク（{ACWI_SHORT}）")
 
 
 # ==========================================
@@ -1105,63 +1190,121 @@ with tab5:
 
         # ─── ⑤ β / α 分析 ───
         st.markdown("#### 🔢 β / α 分析")
-        col_bi, col_be = st.columns(2)
 
-        with col_bi:
-            sel_bench = st.selectbox(
-                "ベンチマーク（ポートフォリオ内）",
-                list(returns.columns), index=0, key="bench_sel",
-            )
-        with col_be:
-            ext_bench_map = {
-                "なし":                     None,
-                "日経225 (^N225)":          "^N225",
-                "S&P500 (^GSPC)":           "^GSPC",
-                "全世界株 MSCI ACWI":       "ACWI",
-                "金 (GLD)":                 "GLD",
-            }
-            sel_ext = st.selectbox(
-                "外部ベンチマーク（Yahoo Finance）",
-                list(ext_bench_map.keys()), index=0, key="ext_bench",
-            )
+        # ポートフォリオ全体リターンを計算して returns に追加
+        port_ret = calc_portfolio_weighted_return(df5, returns)
+        returns_with_port = returns.copy()
+        if not port_ret.empty:
+            returns_with_port["ポートフォリオ"] = port_ret
 
-        # ポートフォリオ内ベンチマーク
-        ba_df = calc_beta_alpha(returns, sel_bench)
+        # ── ① ポートフォリオ内ベンチマーク ──
+        sel_bench = st.selectbox(
+            "ポートフォリオ内ベンチマーク",
+            list(returns.columns), index=0, key="bench_sel",
+        )
+        ba_df = calc_beta_alpha(returns_with_port, sel_bench)
         if not ba_df.empty:
-            st.markdown(f"**vs {sel_bench}（ポートフォリオ内）**")
+            st.markdown(f"**vs {sel_bench}（ポートフォリオ内ベンチマーク）**")
+            st.caption("「ポートフォリオ」行 = 評価額加重ポートフォリオ全体の β/α")
             st.dataframe(ba_df.set_index("ファンド"), use_container_width=True)
 
-        # 外部ベンチマーク（Yahoo Finance）
-        if sel_ext != "なし":
-            symbol = ext_bench_map[sel_ext]
-            with st.spinner(f"{sel_ext} のデータを Yahoo Finance から取得中…"):
-                bench_ret = fetch_benchmark_yahoo(
-                    symbol, str(returns.index.min().date())
-                )
-            if bench_ret is not None:
-                bench_ret.index = pd.to_datetime(bench_ret.index).normalize()
-                common_idx = returns.index.intersection(bench_ret.index)
-                if len(common_idx) >= 20:
-                    ret_ext          = returns.loc[common_idx].copy()
-                    ret_ext[sel_ext] = bench_ret.loc[common_idx]
-                    ba_ext           = calc_beta_alpha(ret_ext, sel_ext)
-                    if not ba_ext.empty:
-                        st.markdown(f"**vs {sel_ext}（外部ベンチマーク）**")
-                        st.dataframe(ba_ext.set_index("ファンド"), use_container_width=True)
-                else:
-                    st.warning(f"共通期間のデータが不足しています（{len(common_idx)}日）。")
+        # ── ② 外部ベンチマーク: eMAXIS Slim 全世界株式（AC）──
+        st.markdown(f"**vs {ACWI_SHORT}（外部ベンチマーク: eMAXIS Slim 全世界株式 AC）**")
+        with st.spinner(f"{ACWI_SHORT} の NAV を toushin-lib から取得中…"):
+            acwi_nav = fetch_acwi_nav()
+
+        if acwi_nav is not None:
+            acwi_ret       = acwi_nav.pct_change().dropna()
+            acwi_ret.index = pd.to_datetime(acwi_ret.index).normalize()
+            common_idx     = returns_with_port.index.intersection(acwi_ret.index)
+            if len(common_idx) >= 20:
+                ret_ext             = returns_with_port.loc[common_idx].copy()
+                ret_ext[ACWI_SHORT] = acwi_ret.loc[common_idx]
+                ba_ext              = calc_beta_alpha(ret_ext, ACWI_SHORT)
+                if not ba_ext.empty:
+                    st.caption("「ポートフォリオ」行 = ポートフォリオ全体の β/α")
+                    st.dataframe(ba_ext.set_index("ファンド"), use_container_width=True)
             else:
-                st.warning(f"{sel_ext} のデータ取得に失敗しました（Yahoo Finance API制限の可能性）。")
+                st.warning(f"共通期間のデータが不足しています（{len(common_idx)}日）。")
+        else:
+            acwi_nav = None
+            st.warning("全世界株（AC）の NAV 取得に失敗しました。")
 
         with st.expander("β / α の解釈"):
             st.markdown("""
 | 指標 | 説明 |
 |------|------|
-| **β** | 市場感応度。β=1.0 はベンチマークと同じ動き、β>1 は増幅 |
-| **α年率** | 市場リターンでは説明できない超過リターン（正なら市場を上回る） |
+| **β** | 市場感応度。β=1.0 はベンチマークと同じ動き、β>1 は増幅、β<0 は逆相関 |
+| **α年率** | 市場リターンでは説明できない超過リターン（正なら市場を上回る実力） |
 | **R²** | ベンチマークによる説明力（0〜1）。高いほど連動性が高い |
 | **TE年率** | トラッキングエラー（年率）。ベンチマークからの乖離の大きさ |
 """)
+        st.markdown("---")
+
+        # ─── ⑦ ベンチマーク比較チャート ───
+        st.markdown(f"#### 📊 ポートフォリオ vs {ACWI_SHORT} 評価額比較")
+        st.caption("同じタイミング・同じ金額で全世界株（AC）に投資していた場合との比較")
+
+        if acwi_nav is not None:
+            # 実際のポートフォリオ評価額（全期間 df から分析期間を切り出し）
+            actual_all = (
+                df.groupby("日付")["評価額"].sum()
+                .rename_axis("日付")
+            )
+            actual_all.index = pd.to_datetime(actual_all.index)
+            actual_filtered  = actual_all[actual_all.index >= start5]
+
+            # 同一キャッシュフローでベンチマーク投資した場合（全期間 df を使う）
+            bench_scenario  = calc_benchmark_scenario(df, acwi_nav)
+            bench_filtered  = bench_scenario[bench_scenario.index >= start5]
+
+            # 累積元本ライン（分析期間）
+            principal_all = (
+                df.groupby("日付")["累積元本"].sum()
+                .rename_axis("日付")
+            )
+            principal_all.index = pd.to_datetime(principal_all.index)
+            principal_filtered  = principal_all[principal_all.index >= start5]
+
+            fig_cmp = go.Figure()
+            fig_cmp.add_trace(go.Scatter(
+                x=actual_filtered.index, y=actual_filtered.values,
+                name="実際のポートフォリオ",
+                line=dict(color="#3498db", width=2.5),
+            ))
+            fig_cmp.add_trace(go.Scatter(
+                x=bench_filtered.index, y=bench_filtered.values,
+                name=f"ベンチマーク（{ACWI_SHORT}）",
+                line=dict(color="#e74c3c", width=2.5, dash="dash"),
+            ))
+            fig_cmp.add_trace(go.Scatter(
+                x=principal_filtered.index, y=principal_filtered.values,
+                name="累積元本",
+                line=dict(color="gray", width=1.5, dash="dot"),
+            ))
+            fig_cmp.update_layout(
+                title=f"ポートフォリオ vs {ACWI_SHORT}（同一キャッシュフロー比較）",
+                yaxis_title="評価額（円）",
+                yaxis_tickprefix="¥", yaxis_tickformat=",",
+                hovermode="x unified", height=430,
+            )
+            st.plotly_chart(fig_cmp, use_container_width=True)
+
+            # 最終日サマリー
+            last_a = actual_filtered.dropna().iloc[-1]  if len(actual_filtered.dropna())  > 0 else 0
+            last_b = bench_filtered.dropna().iloc[-1]   if len(bench_filtered.dropna())   > 0 else 0
+            last_p = principal_filtered.dropna().iloc[-1] if len(principal_filtered.dropna()) > 0 else 0
+            diff   = last_a - last_b
+            col_ca, col_cb, col_cc = st.columns(3)
+            col_ca.metric("実際のポートフォリオ", f"¥{int(last_a):,}",
+                          f"{(last_a - last_p) / last_p * 100:+.2f}%" if last_p else None)
+            col_cb.metric(f"ベンチマーク（{ACWI_SHORT}）", f"¥{int(last_b):,}",
+                          f"{(last_b - last_p) / last_p * 100:+.2f}%" if last_p else None)
+            col_cc.metric("ポートフォリオ優位", f"¥{int(diff):+,}",
+                          "上回っている" if diff >= 0 else "下回っている",
+                          delta_color="normal" if diff >= 0 else "inverse")
+        else:
+            st.info(f"{ACWI_SHORT} のデータ取得後に比較チャートが表示されます。")
         st.markdown("---")
 
         # ─── ⑥ ローリングシャープレシオ ───
