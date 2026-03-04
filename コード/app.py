@@ -72,10 +72,11 @@ def short(name: str) -> str:
 # ==========================================
 # ① Excel → holdings DataFrame
 # ==========================================
-def parse_excel(file_bytes: bytes) -> pd.DataFrame:
-    """取引履歴ExcelをDataFrameに変換して日次データを返す"""
-    df_raw = pd.read_excel(BytesIO(file_bytes), header=0, dtype=str)
-
+def _process_raw_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    列名を内部名に統一し、取引履歴DataFrame → 日次保有状況DataFrameへ変換する共通処理。
+    ExcelとCSV両方から呼び出す。
+    """
     # 列順: 約定日,受渡日,ファンド名,分配金,口座,取引,買付方法,数量[口],単価,経費,為替,受付金額,受渡金額,決済通貨
     COL_14 = ["約定日", "受渡日", "ファンド名", "分配金", "口座", "取引", "買付方法",
               "口数", "基準価額_万口", "経費", "為替レート", "受付金額", "取引金額", "決済通貨"]
@@ -156,6 +157,27 @@ def parse_excel(file_bytes: bytes) -> pd.DataFrame:
 
     df_daily = pd.concat(all_daily, ignore_index=True)
     return df_daily[["日付", "ファンド名", "口座区分", "保有口数", "累積元本", "平均取得価額_万口"]]
+
+
+def parse_excel(file_bytes: bytes) -> pd.DataFrame:
+    """取引履歴ExcelをDataFrameに変換して日次データを返す"""
+    df_raw = pd.read_excel(BytesIO(file_bytes), header=0, dtype=str)
+    return _process_raw_df(df_raw)
+
+
+def parse_csv(file_bytes: bytes) -> pd.DataFrame:
+    """取引履歴CSV（楽天証券エクスポート）をDataFrameに変換して日次データを返す"""
+    last_exc = None
+    for enc in ("utf-8-sig", "shift-jis", "utf-8"):
+        try:
+            df_raw = pd.read_csv(BytesIO(file_bytes), header=0, dtype=str, encoding=enc)
+            return _process_raw_df(df_raw)
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            last_exc = e
+            continue
+    raise ValueError(f"CSVの読み込みに失敗しました: {last_exc}")
 
 
 # ==========================================
@@ -598,139 +620,6 @@ def calc_benchmark_scenario(df_pnl: pd.DataFrame,
 
 
 # ==========================================
-# ⑥ ファクターモデル関数
-# ==========================================
-
-# グローバルスタイルファクター定義 {cache_key: (検索用ファンド名, 短縮ラベル)}
-FACTOR_FUND_DEFS = {
-    "smb_long":  ("ＳＭＴ グローバル小型株インデックス・オープン", "世界小型株"),
-    "hml_long":  ("野村インデックスファンド・外国株式バリュー",    "先進国バリュー"),
-    "hml_short": ("野村インデックスファンド・外国株式グロース",    "先進国グロース"),
-    # smb_short（大型株）は ACWI を流用
-}
-FACTOR_ISIN_FILE = DATA_DIR / "factor_isin_cache.json"
-
-
-def _load_factor_isin_cache() -> dict:
-    if FACTOR_ISIN_FILE.exists():
-        try:
-            with open(FACTOR_ISIN_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def _save_factor_isin_cache(cache: dict) -> None:
-    try:
-        with open(FACTOR_ISIN_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def resolve_factor_isins(progress_fn=None) -> dict:
-    """
-    スタイルファクターファンドの ISIN と assocCd を解決して返す。
-    キャッシュがあればそれを使用し、未解決分のみ自動検索。
-
-    Returns: {cache_key: {"isin": str, "assocCd": str}}
-    """
-    cache   = _load_factor_isin_cache()
-    missing = {k: v for k, v in FACTOR_FUND_DEFS.items() if k not in cache}
-    if not missing:
-        return cache
-
-    sess = requests.Session()
-    sess.headers.update(HEADERS)
-    sess.get(NISA_INIT, timeout=15)
-
-    for i, (key, (fund_name, label)) in enumerate(missing.items()):
-        if progress_fn:
-            progress_fn(f"ファクターファンド検索中 ({i+1}/{len(missing)}): {label}…")
-        isin, assoc, _ = resolve_isin(sess, fund_name)
-        if isin:
-            if not assoc:
-                assoc = _get_assoc_cd(sess, isin)
-            cache[key] = {"isin": isin, "assocCd": assoc or ""}
-        time.sleep(0.3)
-
-    _save_factor_isin_cache(cache)
-    return cache
-
-
-@st.cache_data(ttl=86400)
-def fetch_style_nav(isin: str, assoc_cd: str, label: str) -> "pd.Series | None":
-    """スタイルファクターファンドの NAV を toushin-lib から取得（24h キャッシュ）"""
-    try:
-        sess = requests.Session()
-        sess.headers.update(HEADERS)
-        sess.get(NISA_INIT, timeout=15)
-        sess.get(f"{DETAIL}?isinCd={isin}", timeout=15)
-        r = sess.get(CSV_DL, params={"isinCd": isin, "associFundCd": assoc_cd}, timeout=30)
-        if r.status_code != 200 or len(r.content) < 500:
-            return None
-        df_b = pd.read_csv(BytesIO(r.content), encoding="shift-jis")
-        df_b["日付"]    = pd.to_datetime(df_b["年月日"], format="%Y年%m月%d日")
-        df_b["基準価額"] = pd.to_numeric(df_b["基準価額(円)"], errors="coerce")
-        s = df_b.set_index("日付")["基準価額"].dropna().sort_index()
-        s.name = label
-        return s
-    except Exception:
-        return None
-
-
-def calc_three_factor_model(
-    returns: pd.DataFrame,
-    mkt_ret: "pd.Series | None",
-    smb_ret: "pd.Series | None",
-    hml_ret: "pd.Series | None",
-) -> pd.DataFrame:
-    """
-    Fama-French 3ファクターモデル（OLS回帰）。
-    R_i = α + β_mkt×MKT + β_smb×SMB + β_hml×HML + ε
-    利用可能なファクターのみで回帰（1〜3ファクター）。
-    """
-    factor_map: dict[str, pd.Series] = {}
-    for lbl, fs in [("MKT", mkt_ret), ("SMB", smb_ret), ("HML", hml_ret)]:
-        if fs is not None and not fs.empty:
-            factor_map[lbl] = fs
-
-    if not factor_map:
-        return pd.DataFrame()
-
-    rows = []
-    for col in returns.columns:
-        r   = returns[col].dropna()
-        idx = r.index
-        for fs in factor_map.values():
-            idx = idx.intersection(fs.index)
-        if len(idx) < 30:
-            continue
-
-        r_c = r.loc[idx].values
-        X   = np.column_stack([np.ones(len(idx))] + [factor_map[l].loc[idx].values for l in factor_map])
-
-        coeffs, *_ = np.linalg.lstsq(X, r_c, rcond=None)
-        alpha_ann  = float(coeffs[0]) * 252 * 100
-        betas      = coeffs[1:]
-
-        y_hat  = X @ coeffs
-        ss_res = np.sum((r_c - y_hat) ** 2)
-        ss_tot = np.sum((r_c - r_c.mean()) ** 2)
-        r2     = float(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
-
-        row = {"ファンド": col, "α年率(%)": round(alpha_ann, 2)}
-        for i, lbl in enumerate(factor_map):
-            row[f"β_{lbl}"] = round(float(betas[i]), 3)
-        row["R²"]  = round(r2, 3)
-        row["N日"] = len(idx)
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-# ==========================================
 # ページ設定
 # ==========================================
 st.set_page_config(
@@ -760,9 +649,9 @@ with st.sidebar:
     st.markdown("---")
 
     uploaded = st.file_uploader(
-        "取引履歴Excelをアップロード",
-        type=["xlsx"],
-        help="楽天証券からダウンロードした取引履歴(INVST)ファイル",
+        "取引履歴をアップロード（Excel / CSV）",
+        type=["xlsx", "csv"],
+        help="楽天証券からダウンロードした取引履歴ファイル（.xlsx または .csv）",
     )
 
     update_btn = st.button("📡 NAV・損益を更新", type="primary", use_container_width=True)
@@ -784,7 +673,11 @@ if uploaded is not None:
         # 新しいファイルのみ処理
         with st.spinner("取引履歴を処理中..."):
             try:
-                df_holdings = parse_excel(uploaded.read())
+                raw_bytes = uploaded.read()
+                if uploaded.name.lower().endswith(".csv"):
+                    df_holdings = parse_csv(raw_bytes)
+                else:
+                    df_holdings = parse_excel(raw_bytes)
                 df_holdings.to_csv(HOLD_CSV, encoding="utf-8-sig", index=False)
                 st.sidebar.success(f"✅ {len(df_holdings):,}行を読み込みました")
                 st.session_state.last_processed_file_id = file_id
@@ -1443,147 +1336,6 @@ with tab5:
                 st.warning("TWR 比較に必要な共通期間のデータが不足しています。")
         else:
             st.info(f"{ACWI_SHORT} のデータ取得後に比較チャートが表示されます。")
-        st.markdown("---")
-
-        # ─── ⑧ 3ファクターモデル（グローバルスタイル）───
-        st.markdown("#### 🧮 3ファクターモデル（グローバルスタイル）")
-        st.caption(
-            "MKT = 全世界株(AC)超過リターン, "
-            "SMB = 世界小型株 − 全世界株(AC), "
-            "HML = 先進国バリュー − 先進国グロース"
-        )
-
-        # ① ファクターファンドISINの解決（キャッシュ優先）
-        factor_isin_cache = _load_factor_isin_cache()
-        missing_keys = [k for k in FACTOR_FUND_DEFS if k not in factor_isin_cache]
-
-        if missing_keys:
-            st.info(
-                f"スタイルファクターファンドの ISIN が未解決です（{len(missing_keys)}本）。"
-                "下のボタンで一度だけ自動検索します（1〜2分かかります）。"
-            )
-            if st.button("🔍 ファクターファンドのISINを自動検索", key="resolve_factor"):
-                with st.spinner("toushin-lib でスタイルファクターファンドを検索中…"):
-                    msgs = st.empty()
-                    factor_isin_cache = resolve_factor_isins(
-                        progress_fn=lambda m: msgs.caption(m)
-                    )
-                    msgs.empty()
-                found = [k for k in FACTOR_FUND_DEFS if k in factor_isin_cache]
-                st.success(f"✅ {len(found)}/{len(FACTOR_FUND_DEFS)} ファンドの ISIN を取得しました。")
-                st.rerun()
-
-        # ② ファクターNAVを取得してリターン系列を構築
-        if not missing_keys:
-            with st.spinner("スタイルファクターの NAV を取得中…"):
-                smb_long_nav = smb_short_nav = hml_long_nav = hml_short_nav = None
-
-                if "smb_long" in factor_isin_cache:
-                    fi = factor_isin_cache["smb_long"]
-                    _, lbl = FACTOR_FUND_DEFS["smb_long"]
-                    smb_long_nav = fetch_style_nav(fi["isin"], fi["assocCd"], lbl)
-
-                if "hml_long" in factor_isin_cache:
-                    fi = factor_isin_cache["hml_long"]
-                    _, lbl = FACTOR_FUND_DEFS["hml_long"]
-                    hml_long_nav = fetch_style_nav(fi["isin"], fi["assocCd"], lbl)
-
-                if "hml_short" in factor_isin_cache:
-                    fi = factor_isin_cache["hml_short"]
-                    _, lbl = FACTOR_FUND_DEFS["hml_short"]
-                    hml_short_nav = fetch_style_nav(fi["isin"], fi["assocCd"], lbl)
-
-            # ③ ファクターリターン計算
-            def _nav_to_ret(nav: "pd.Series | None") -> "pd.Series | None":
-                if nav is None:
-                    return None
-                r = nav.pct_change().dropna()
-                r.index = pd.to_datetime(r.index).normalize()
-                return r
-
-            acwi_ret5 = None
-            if acwi_nav is not None:
-                acwi_ret5 = acwi_nav.pct_change().dropna()
-                acwi_ret5.index = pd.to_datetime(acwi_ret5.index).normalize()
-
-            smb_long_ret  = _nav_to_ret(smb_long_nav)
-            hml_long_ret  = _nav_to_ret(hml_long_nav)
-            hml_short_ret = _nav_to_ret(hml_short_nav)
-
-            # SMB = 小型株リターン − 全世界株(大型代理) リターン
-            smb_ret = None
-            if smb_long_ret is not None and acwi_ret5 is not None:
-                common_smb = smb_long_ret.index.intersection(acwi_ret5.index)
-                if len(common_smb) > 20:
-                    smb_ret = (smb_long_ret.loc[common_smb]
-                               - acwi_ret5.loc[common_smb])
-                    smb_ret.name = "SMB"
-
-            # HML = バリューリターン − グロースリターン
-            hml_ret = None
-            if hml_long_ret is not None and hml_short_ret is not None:
-                common_hml = hml_long_ret.index.intersection(hml_short_ret.index)
-                if len(common_hml) > 20:
-                    hml_ret = (hml_long_ret.loc[common_hml]
-                               - hml_short_ret.loc[common_hml])
-                    hml_ret.name = "HML"
-
-            # MKT = ACWI リターン
-            mkt_ret = acwi_ret5
-
-            # ④ 回帰実行
-            factor_avail = [l for l, r in [("MKT", mkt_ret), ("SMB", smb_ret), ("HML", hml_ret)] if r is not None]
-            if factor_avail:
-                fm_df = calc_three_factor_model(returns_with_port, mkt_ret, smb_ret, hml_ret)
-
-                if not fm_df.empty:
-                    st.markdown(f"**回帰ファクター: {', '.join(factor_avail)}**")
-                    st.dataframe(fm_df.set_index("ファンド"), use_container_width=True)
-
-                    # ⑤ β 棒グラフ
-                    beta_cols = [c for c in fm_df.columns if c.startswith("β_")]
-                    if beta_cols:
-                        fig_fm = go.Figure()
-                        colors_fm = {"β_MKT": "#3498db", "β_SMB": "#2ecc71", "β_HML": "#e67e22"}
-                        for bc in beta_cols:
-                            fig_fm.add_trace(go.Bar(
-                                name=bc,
-                                x=fm_df["ファンド"],
-                                y=fm_df[bc],
-                                marker_color=colors_fm.get(bc, "#95a5a6"),
-                            ))
-                        fig_fm.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
-                        fig_fm.update_layout(
-                            barmode="group",
-                            title="ファクターエクスポージャー（β）",
-                            yaxis_title="β",
-                            height=360,
-                            hovermode="x unified",
-                        )
-                        st.plotly_chart(fig_fm, use_container_width=True)
-                else:
-                    st.warning("回帰に必要な共通期間のデータが不足しています（最低30日）。")
-            else:
-                st.warning("ファクターリターンの計算に必要なデータが取得できませんでした。")
-
-            with st.expander("3ファクターモデルの解釈"):
-                st.markdown("""
-| ファクター | 説明 |
-|-----------|------|
-| **β_MKT** | 市場全体リターンへの感応度。1.0 でベンチマーク並みのリスク |
-| **β_SMB** | サイズファクター感応度。正 = 小型株バイアス、負 = 大型株バイアス |
-| **β_HML** | バリューファクター感応度。正 = バリュー株バイアス、負 = グロース株バイアス |
-| **α年率** | 3ファクターで説明できない超過リターン（真の「運用力」） |
-| **R²** | 3ファクターによる説明力（1に近いほどファクターで説明できる） |
-
-SMBファンド: {smb_name}
-HMLファンド: {hml_long_name} ー {hml_short_name}
-""".format(
-                    smb_name   = FACTOR_FUND_DEFS["smb_long"][0]  if smb_ret is not None else "取得失敗",
-                    hml_long_name  = FACTOR_FUND_DEFS["hml_long"][0]  if hml_ret is not None else "取得失敗",
-                    hml_short_name = FACTOR_FUND_DEFS["hml_short"][0] if hml_ret is not None else "取得失敗",
-                ))
-
         st.markdown("---")
 
         # ─── ⑥ ローリングシャープレシオ ───
