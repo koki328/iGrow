@@ -1,0 +1,28 @@
+# 生成されるCSV（アプリ内で都度生成するのでコミット不要）
+データ/holdings_daily.csv
+データ/holdings_history.csv
+データ/nav_history.csv
+データ/pnl_daily.csv
+データ/isin_mapping.csv
+
+# 取引履歴Excelは個人情報なのでコミットしない
+データ/*.xlsx
+データ/*.xls
+データ/*.csv.bak
+
+# デバッグスクリプト（不要）
+コード/debug_*.py
+コード/test_*.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code session data
+.claude/
