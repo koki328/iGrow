@@ -452,15 +452,25 @@ with st.sidebar:
 do_update = update_btn
 
 if uploaded is not None:
-    with st.spinner("取引履歴を処理中..."):
-        try:
-            df_holdings = parse_excel(uploaded.read())
-            df_holdings.to_csv(HOLD_CSV, encoding="utf-8-sig", index=False)
-            st.sidebar.success(f"✅ {len(df_holdings):,}行を読み込みました")
-            do_update = True
-        except Exception as e:
-            st.sidebar.error(f"読み込みエラー: {e}")
-            df_holdings = None
+    file_id = uploaded.file_id  # アップロードごとに一意なID
+    if st.session_state.get("last_processed_file_id") != file_id:
+        # 新しいファイルのみ処理
+        with st.spinner("取引履歴を処理中..."):
+            try:
+                df_holdings = parse_excel(uploaded.read())
+                df_holdings.to_csv(HOLD_CSV, encoding="utf-8-sig", index=False)
+                st.sidebar.success(f"✅ {len(df_holdings):,}行を読み込みました")
+                st.session_state.last_processed_file_id = file_id
+                do_update = True
+            except Exception as e:
+                st.sidebar.error(f"読み込みエラー: {e}")
+                df_holdings = None
+    else:
+        # 同じファイルは再処理しない（reruns でのループ防止）
+        df_holdings = (
+            pd.read_csv(HOLD_CSV, encoding="utf-8-sig")
+            if HOLD_CSV.exists() else None
+        )
 else:
     df_holdings = (
         pd.read_csv(HOLD_CSV, encoding="utf-8-sig")
@@ -518,7 +528,6 @@ if do_update:
             st.session_state.df_pnl = df_pnl
             prog.empty()
             st.success("✅ データ更新完了")
-            st.rerun()
         except Exception as e:
             prog.empty()
             st.error(f"更新エラー: {e}")
