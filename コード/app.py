@@ -14,6 +14,7 @@ import unicodedata
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -404,6 +405,114 @@ def calc_pnl(df_h: pd.DataFrame, df_n: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==========================================
+# ⑤ リスク・リターン分析関数
+# ==========================================
+def calc_daily_returns(df_pnl: pd.DataFrame) -> pd.DataFrame:
+    """各ファンドの日次リターンを計算（基準価額ベース）"""
+    df_nav = (
+        df_pnl
+        .groupby(["日付", "ファンド名"])["基準価額"]
+        .first()
+        .reset_index()
+    )
+    df_wide = df_nav.pivot(index="日付", columns="ファンド名", values="基準価額")
+    df_wide.columns.name = None
+    df_wide = df_wide.sort_index()
+    return df_wide.pct_change().dropna(how="all")
+
+
+def _max_drawdown(cum_ret: pd.Series) -> float:
+    dd = (cum_ret / cum_ret.cummax()) - 1
+    return float(dd.min())
+
+
+def calc_risk_metrics(returns: pd.DataFrame, rf_annual: float = 0.001) -> pd.DataFrame:
+    """各ファンドの年率リターン・シャープ・VaR等を計算"""
+    rf_daily = rf_annual / 252
+    rows = []
+    for col in returns.columns:
+        r = returns[col].dropna()
+        if len(r) < 20:
+            continue
+        n = len(r)
+        cum        = float((1 + r).prod())
+        ann_ret    = cum ** (252 / n) - 1
+        ann_vol    = float(r.std() * np.sqrt(252))
+        sharpe     = float((r - rf_daily).mean() / r.std() * np.sqrt(252)) if r.std() > 0 else float("nan")
+        cum_s      = (1 + r).cumprod()
+        mdd        = _max_drawdown(cum_s)
+        var95      = float(r.quantile(0.05))
+        cvar95     = float(r[r <= var95].mean())
+        win_rate   = float((r > 0).mean())
+        rows.append({
+            "ファンド":        col,
+            "年率リターン(%)": round(ann_ret  * 100, 2),
+            "年率ボラ(%)":     round(ann_vol  * 100, 2),
+            "シャープ":        round(sharpe,         3),
+            "最大DD(%)":       round(mdd      * 100, 2),
+            "VaR95(日次,%)":   round(var95    * 100, 2),
+            "CVaR95(日次,%)":  round(cvar95   * 100, 2),
+            "勝率(%)":         round(win_rate * 100, 1),
+        })
+    return pd.DataFrame(rows)
+
+
+def calc_beta_alpha(returns: pd.DataFrame, benchmark_col: str) -> pd.DataFrame:
+    """各ファンドの β・α（対ベンチマーク）を計算"""
+    if benchmark_col not in returns.columns:
+        return pd.DataFrame()
+    bench = returns[benchmark_col].dropna()
+    rows  = []
+    for col in returns.columns:
+        if col == benchmark_col:
+            continue
+        r      = returns[col].dropna()
+        common = r.index.intersection(bench.index)
+        if len(common) < 20:
+            continue
+        r_c = r.loc[common].values
+        b_c = bench.loc[common].values
+        cov  = np.cov(r_c, b_c)
+        beta = cov[0, 1] / cov[1, 1] if cov[1, 1] > 0 else float("nan")
+        alpha_d = float(np.mean(r_c)) - beta * float(np.mean(b_c))
+        alpha_a = alpha_d * 252 * 100          # 年率 %
+        ss_res  = np.sum((r_c - (alpha_d + beta * b_c)) ** 2)
+        ss_tot  = np.sum((r_c - np.mean(r_c)) ** 2)
+        r2      = float(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+        te      = float(np.std(r_c - b_c) * np.sqrt(252) * 100)
+        rows.append({
+            "ファンド":    col,
+            "β":           round(beta,    3),
+            "α年率(%)":    round(alpha_a, 2),
+            "R²":          round(r2,      3),
+            "TE年率(%)":   round(te,      2),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600)
+def fetch_benchmark_yahoo(symbol: str, start_date: str) -> pd.Series | None:
+    """Yahoo Finance から日次リターンを取得（キャッシュ1時間）"""
+    try:
+        url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {
+            "interval": "1d",
+            "period1":  int(pd.Timestamp(start_date).timestamp()),
+            "period2":  int(pd.Timestamp.now().timestamp()),
+        }
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        result = r.json()["chart"]["result"][0]
+        dates  = pd.to_datetime(result["timestamp"], unit="s").normalize()
+        closes = result["indicators"]["quote"][0]["close"]
+        s      = pd.Series(closes, index=dates, name=symbol, dtype=float).dropna()
+        return s.pct_change().dropna()
+    except Exception:
+        return None
+
+
+# ==========================================
 # ページ設定
 # ==========================================
 st.set_page_config(
@@ -552,11 +661,12 @@ df = st.session_state.df_pnl.copy()
 df["日付"] = pd.to_datetime(df["日付"])
 latest_dt = df["日付"].max()
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 サマリー",
     "📈 評価額推移",
     "📉 損益推移",
     "🔍 ファンド詳細",
+    "📐 リスク・リターン",
 ])
 
 # ──────────────────────────────
@@ -870,3 +980,215 @@ with tab4:
             df_acct_disp["損益額"]   = df_acct_disp["損益額"].apply(lambda x: f"¥{int(x):+,}")
             df_acct_disp["損益率(%)"] = df_acct_disp["損益率(%)"].apply(lambda x: f"{x:+.2f}%")
             st.dataframe(df_acct_disp, use_container_width=True, hide_index=True)
+
+# ──────────────────────────────
+# Tab 5: リスク・リターン分析
+# ──────────────────────────────
+with tab5:
+    # 分析期間
+    period5_opts = {"1年": 12, "2年": 24, "3年": 36, "全期間": None}
+    sel_p5  = st.radio("分析期間", list(period5_opts.keys()), horizontal=True, index=3, key="p5")
+    months5 = period5_opts[sel_p5]
+    start5  = (latest_dt - pd.DateOffset(months=months5)) if months5 else df["日付"].min()
+    df5     = df[df["日付"] >= start5].copy()
+
+    returns = calc_daily_returns(df5)
+    returns.columns = [short(c) for c in returns.columns]
+
+    if returns.empty or len(returns) < 20:
+        st.warning("リターン計算に必要なデータが不足しています（最低20営業日）。")
+    else:
+        # ─── ① パフォーマンス指標テーブル ───
+        st.markdown("#### 📊 パフォーマンス指標")
+        metrics_df = calc_risk_metrics(returns)
+        st.dataframe(metrics_df.set_index("ファンド"), use_container_width=True)
+
+        with st.expander("指標の説明"):
+            st.markdown("""
+| 指標 | 説明 |
+|------|------|
+| 年率リターン | 保有期間のリターンを1年に換算 |
+| 年率ボラ | 日次リターンの標準偏差 × √252（リスクの大きさ） |
+| シャープ | 超過リターン / ボラティリティ。1以上が目安 |
+| 最大DD | 最高値からの最大下落率（最大ドローダウン） |
+| VaR95 | 95%信頼区間の最悪日次損失（ヒストリカル法） |
+| CVaR95 | VaR超過時の平均損失（テールリスク・ES） |
+| 勝率 | 日次リターンがプラスの割合 |
+""")
+
+        st.markdown("---")
+
+        # ─── ② リスク・リターン散布図 / 相関マトリクス ───
+        col_sc, col_cr = st.columns(2)
+
+        with col_sc:
+            st.markdown("#### 🎯 リスク・リターン散布図")
+            latest5     = df5[df5["日付"] == df5["日付"].max()]
+            eval_by_f   = latest5.groupby("ファンド短縮名")["評価額"].sum().reset_index()
+            scatter_df  = metrics_df.merge(
+                eval_by_f, left_on="ファンド", right_on="ファンド短縮名", how="left"
+            )
+            fig_sc = px.scatter(
+                scatter_df,
+                x="年率ボラ(%)", y="年率リターン(%)",
+                size="評価額", color="ファンド", text="ファンド",
+                title="効率的フロンティア図（バブル = 評価額）",
+                color_discrete_map=FUND_COLORS,
+            )
+            fig_sc.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+            fig_sc.update_traces(textposition="top center")
+            fig_sc.update_layout(
+                xaxis_ticksuffix="%", yaxis_ticksuffix="%",
+                showlegend=False, height=380,
+            )
+            st.plotly_chart(fig_sc, use_container_width=True)
+
+        with col_cr:
+            st.markdown("#### 🔗 相関マトリクス")
+            corr = returns.corr()
+            fig_corr = px.imshow(
+                corr, text_auto=".2f",
+                color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                title="日次リターンの相関係数",
+            )
+            fig_corr.update_layout(height=380)
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+        st.caption("相関が低い（青い）ほど分散効果が高く、同一方向に動きにくい")
+        st.markdown("---")
+
+        # ─── ③ ドローダウン推移 ───
+        st.markdown("#### 📉 ドローダウン推移")
+        cum_ret = (1 + returns).cumprod()
+        dd_pct  = ((cum_ret / cum_ret.cummax()) - 1) * 100
+        dd_long = dd_pct.reset_index().melt(
+            id_vars="日付", var_name="ファンド", value_name="DD(%)"
+        )
+        fig_dd = px.line(
+            dd_long, x="日付", y="DD(%)",
+            color="ファンド", title="ドローダウン推移",
+            color_discrete_map=FUND_COLORS,
+        )
+        fig_dd.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+        fig_dd.update_layout(yaxis_ticksuffix="%", hovermode="x unified", height=340)
+        st.plotly_chart(fig_dd, use_container_width=True)
+        st.markdown("---")
+
+        # ─── ④ 日次リターン分布 & VaR ───
+        st.markdown("#### 📊 日次リターン分布 & VaR")
+        sel_vf = st.selectbox("ファンド選択", returns.columns.tolist(), key="var_fund")
+        r_sel  = returns[sel_vf].dropna()
+        var95  = float(r_sel.quantile(0.05))
+        var99  = float(r_sel.quantile(0.01))
+
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=(r_sel * 100).values, nbinsx=60,
+            name="日次リターン", marker_color="#3498db", opacity=0.75,
+        ))
+        for v, c, lbl in [(var95, "orange", "VaR95"), (var99, "red", "VaR99")]:
+            fig_hist.add_vline(
+                x=v * 100, line_dash="dash", line_color=c,
+                annotation_text=f"{lbl}: {v*100:.2f}%",
+            )
+        fig_hist.update_layout(
+            title=f"{sel_vf} ─ 日次リターン分布",
+            xaxis_title="日次リターン (%)", yaxis_title="日数",
+            xaxis_ticksuffix="%", bargap=0.05, height=320,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+        st.caption(
+            f"VaR95: 95%の確率で1日の損失は **{abs(var95)*100:.2f}%** 以内  "
+            f"｜  VaR99: 99%の確率で **{abs(var99)*100:.2f}%** 以内"
+        )
+        st.markdown("---")
+
+        # ─── ⑤ β / α 分析 ───
+        st.markdown("#### 🔢 β / α 分析")
+        col_bi, col_be = st.columns(2)
+
+        with col_bi:
+            sel_bench = st.selectbox(
+                "ベンチマーク（ポートフォリオ内）",
+                list(returns.columns), index=0, key="bench_sel",
+            )
+        with col_be:
+            ext_bench_map = {
+                "なし":                     None,
+                "日経225 (^N225)":          "^N225",
+                "S&P500 (^GSPC)":           "^GSPC",
+                "全世界株 MSCI ACWI":       "ACWI",
+                "金 (GLD)":                 "GLD",
+            }
+            sel_ext = st.selectbox(
+                "外部ベンチマーク（Yahoo Finance）",
+                list(ext_bench_map.keys()), index=0, key="ext_bench",
+            )
+
+        # ポートフォリオ内ベンチマーク
+        ba_df = calc_beta_alpha(returns, sel_bench)
+        if not ba_df.empty:
+            st.markdown(f"**vs {sel_bench}（ポートフォリオ内）**")
+            st.dataframe(ba_df.set_index("ファンド"), use_container_width=True)
+
+        # 外部ベンチマーク（Yahoo Finance）
+        if sel_ext != "なし":
+            symbol = ext_bench_map[sel_ext]
+            with st.spinner(f"{sel_ext} のデータを Yahoo Finance から取得中…"):
+                bench_ret = fetch_benchmark_yahoo(
+                    symbol, str(returns.index.min().date())
+                )
+            if bench_ret is not None:
+                bench_ret.index = pd.to_datetime(bench_ret.index).normalize()
+                common_idx = returns.index.intersection(bench_ret.index)
+                if len(common_idx) >= 20:
+                    ret_ext          = returns.loc[common_idx].copy()
+                    ret_ext[sel_ext] = bench_ret.loc[common_idx]
+                    ba_ext           = calc_beta_alpha(ret_ext, sel_ext)
+                    if not ba_ext.empty:
+                        st.markdown(f"**vs {sel_ext}（外部ベンチマーク）**")
+                        st.dataframe(ba_ext.set_index("ファンド"), use_container_width=True)
+                else:
+                    st.warning(f"共通期間のデータが不足しています（{len(common_idx)}日）。")
+            else:
+                st.warning(f"{sel_ext} のデータ取得に失敗しました（Yahoo Finance API制限の可能性）。")
+
+        with st.expander("β / α の解釈"):
+            st.markdown("""
+| 指標 | 説明 |
+|------|------|
+| **β** | 市場感応度。β=1.0 はベンチマークと同じ動き、β>1 は増幅 |
+| **α年率** | 市場リターンでは説明できない超過リターン（正なら市場を上回る） |
+| **R²** | ベンチマークによる説明力（0〜1）。高いほど連動性が高い |
+| **TE年率** | トラッキングエラー（年率）。ベンチマークからの乖離の大きさ |
+""")
+        st.markdown("---")
+
+        # ─── ⑥ ローリングシャープレシオ ───
+        st.markdown("#### 📈 ローリングシャープレシオ")
+        rf_d   = 0.001 / 252
+        window = min(252, max(60, len(returns) // 3))
+        roll_s = (
+            (returns - rf_d).rolling(window).mean()
+            / returns.rolling(window).std()
+            * np.sqrt(252)
+        ).dropna(how="all")
+
+        if len(roll_s) >= 1:
+            rs_long = roll_s.reset_index().melt(
+                id_vars="日付", var_name="ファンド", value_name="シャープレシオ"
+            )
+            fig_rs = px.line(
+                rs_long, x="日付", y="シャープレシオ",
+                color="ファンド",
+                title=f"ローリングシャープレシオ（{window}日窓）",
+                color_discrete_map=FUND_COLORS,
+            )
+            fig_rs.add_hline(y=0,  line_dash="dot", line_color="gray",  opacity=0.5)
+            fig_rs.add_hline(y=1,  line_dash="dot", line_color="green", opacity=0.6,
+                             annotation_text="1.0", annotation_position="right")
+            fig_rs.add_hline(y=-1, line_dash="dot", line_color="red",   opacity=0.4,
+                             annotation_text="-1.0", annotation_position="right")
+            fig_rs.update_layout(hovermode="x unified", height=380)
+            st.plotly_chart(fig_rs, use_container_width=True)
+            st.caption("シャープレシオ > 1 が高パフォーマンスの目安。時系列で見ることで市場局面の変化を把握できる。")
